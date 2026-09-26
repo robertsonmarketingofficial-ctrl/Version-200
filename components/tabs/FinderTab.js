@@ -84,6 +84,21 @@ function FinderTab({ pipeline = [], addToPipeline, addManyToPipeline, searchHist
     setAddedLeadIds(prev => new Set([...prev, ...hotLeads.map(l => l.id)]))
   }
 
+  // Add every business from this search that has NO website at all (not
+  // even a Facebook/Instagram page) in one click. Uses the full result set,
+  // not just what the current filters show. Duplicates already in the
+  // Pipeline are skipped by addManyToPipeline.
+  const pipelineIds = new Set(pipeline.map(l => l.id))
+  const noWebsiteNotAdded = allLeads.filter(l => !l.website && !pipelineIds.has(l.id))
+  const addAllNoWebsiteToPipeline = () => {
+    if (!noWebsiteNotAdded.length) {
+      showToast(allLeads.some(l => !l.website) ? 'All no-website businesses are already in your Pipeline' : 'No businesses without a website in these results')
+      return
+    }
+    addManyToPipeline(noWebsiteNotAdded)
+    setAddedLeadIds(prev => new Set([...prev, ...noWebsiteNotAdded.map(l => l.id)]))
+  }
+
   const doSearch = async (loc, maxPages = 2) => {
     const res = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: category, location: loc, maxPages }) })
     const data = await res.json()
@@ -229,6 +244,13 @@ function FinderTab({ pipeline = [], addToPipeline, addManyToPipeline, searchHist
               style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 16px', borderRadius: 10, border: '2px solid var(--olive)', background: 'rgba(122,158,73,0.15)', color: 'var(--olive2)', cursor: 'pointer', fontSize: 13, fontWeight: 700, transition: 'all 0.18s', whiteSpace: 'nowrap' }}>
               <span style={{ fontSize: 16 }}>🔥</span>
               Add All HOT
+            </button>
+            {/* ADD ALL NO-WEBSITE TO PIPELINE */}
+            <button onClick={addAllNoWebsiteToPipeline}
+              style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 16px', borderRadius: 10, border: '2px solid #f43f5e', background: 'rgba(244,63,94,0.15)', color: '#f43f5e', cursor: 'pointer', fontSize: 13, fontWeight: 700, transition: 'all 0.18s', whiteSpace: 'nowrap' }}>
+              <span style={{ fontSize: 16 }}>➕</span>
+              Add All With No Website to Pipeline
+              <span style={{ background: '#f43f5e', color: '#fff', borderRadius: 100, fontSize: 10, padding: '1px 7px' }}>{noWebsiteNotAdded.length}</span>
             </button>
             {/* NO WEBSITE TOGGLE */}
             <button onClick={() => setNoWebsiteOnly(!noWebsiteOnly)}
