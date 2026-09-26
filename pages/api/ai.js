@@ -17,7 +17,7 @@ Rating: ${lead.rating ? `${lead.rating}/5 (${lead.reviewCount || 0} reviews)` : 
 Category: ${lead.category || 'Local business'}`
 }
 
-function buildPrompt(type, lead, question) {
+function buildPrompt(type, lead, question, objection) {
   if (type === 'research') return `You are a sharp sales research assistant for ${CALLUM.name}, a marketing consultant.
 ${businessCtx(lead)}
 Question: ${question}
@@ -211,7 +211,7 @@ export default async function handler(req, res) {
     })
   }
 
-  const prompt = buildPrompt(type, lead, question)
+  const prompt = buildPrompt(type, lead, question, objection)
   if (!prompt) return res.status(400).json({ error: `Unknown type: ${type}` })
 
   // Try Gemini first

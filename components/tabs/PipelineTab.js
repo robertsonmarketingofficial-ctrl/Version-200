@@ -145,7 +145,7 @@ function QuickAddModal({ onAdd, onClose }) {
   )
 }
 
-function PipelineTab({ pipeline, savePipeline, showToast, setTab }) {
+function PipelineTab({ pipeline, savePipeline, addToPipeline, showToast, setTab }) {
   const [filter, setFilter] = useState('All')
   const [stateFilter, setStateFilter] = useState('All')
   const [search, setSearch] = useState('')

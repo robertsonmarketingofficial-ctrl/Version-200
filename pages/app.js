@@ -180,7 +180,7 @@ function PowerHourWidget({ pipeline, onClose }) {
 }
 
 
-export default function AppV2() {
+function AppV2() {
   const [tab, setTab] = useState('dashboard')
   const [pipeline, setPipeline] = useState([])
   const [searchHistory, setSearchHistory] = useState([])
@@ -214,7 +214,7 @@ export default function AppV2() {
   const savePerformance = (p) => { setPerformance(p); save('rmv2_performance', p) }
   const saveAnalyticsOverrides = (o) => { setAnalyticsOverrides(o); save('rmv2_analytics_overrides', o) }
 
-  const buildPipelineLead = (lead) => ({ ...lead, stage: lead.stage || 'New', notes: '', activityLog: [], followUpDate: '', dealValue: 1500, addedAt: new Date().toISOString() })
+  const buildPipelineLead = (lead) => ({ ...lead, stage: lead.stage || 'New', notes: lead.notes || '', activityLog: [], followUpDate: '', dealValue: 1500, addedAt: new Date().toISOString() })
 
   const autoScrapeEmail = async (lead) => {
     if (!lead.website || lead.email) return
@@ -329,3 +329,10 @@ export default function AppV2() {
   )
 }
 
+
+// The whole CRM lives in browser storage (localStorage) and picks a random
+// quote on load, so server-rendered HTML can never match the first browser
+// render — React threw hydration errors #418/#425 on every page load. Render
+// client-side only.
+import dynamic from 'next/dynamic'
+export default dynamic(() => Promise.resolve(AppV2), { ssr: false })

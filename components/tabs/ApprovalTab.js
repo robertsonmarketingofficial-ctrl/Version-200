@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Spinner, TierTag, ScoreRing, EmptyState } from '../shared'
 import { PageHeader } from './helpers'
 import { getTodaySentCount, recordSend, getAccountCounts, buildCapacityView, hasBeenContacted, markContacted, whenContacted } from '../sendTracker'
+import { apiJSON } from '../api'
 
 const LOG_COLORS = { sent: '#10b981', failed: '#ef4444', info: 'var(--text2)' }
 const LOG_ICONS = { sent: '✓', failed: '✗', info: '—' }
@@ -43,8 +44,7 @@ function ApprovalTab({ pipeline, savePipeline, showToast }) {
   }
   const refreshCapacity = async () => {
     try {
-      const r = await fetch('/api/email-capacity')
-      const config = await r.json()
+      const config = await apiJSON('/api/email-capacity')
       setCapacity(buildCapacityView(config))
     } catch {}
   }
@@ -98,9 +98,11 @@ function ApprovalTab({ pipeline, savePipeline, showToast }) {
 
     const candidates = pipeline.filter(l => selected.has(l.id))
     const seenEmails = new Set()
-    const toSend = [], duplicatesInBatch = [], alreadyContacted = []
+    const toSend = [], duplicatesInBatch = [], alreadyContacted = [], skippedNoAddress = []
+    const addressOf = (l) => channel === 'sms' ? (l.phone || '') : (l.email || '')
     for (const lead of candidates) {
-      const email = (lead.email || '').toLowerCase()
+      const email = addressOf(lead).toLowerCase()
+      if (!email) { skippedNoAddress.push(lead); continue }
       // Never email an address that has EVER been emailed before, even from
       // a different sweep months ago. Protects sender reputation.
       if (hasBeenContacted(email)) { alreadyContacted.push(lead); continue }
@@ -111,11 +113,12 @@ function ApprovalTab({ pipeline, savePipeline, showToast }) {
     if (alreadyContacted.length) {
       addSendLog(`Skipped ${alreadyContacted.length} already contacted previously:`, 'warn')
       alreadyContacted.slice(0, 10).forEach(l => {
-        const when = whenContacted(l.email)
+        const when = whenContacted(addressOf(l))
         addSendLog(`  ${l.name} — last contacted ${when ? new Date(when).toLocaleDateString('en-AU') : 'previously'}`, 'warn')
       })
       if (alreadyContacted.length > 10) addSendLog(`  ...and ${alreadyContacted.length - 10} more`, 'warn')
     }
+    if (skippedNoAddress.length) addSendLog(`Skipped ${skippedNoAddress.length} with no ${channel === 'sms' ? 'phone number' : 'email address'}`, 'warn')
     if (duplicatesInBatch.length) addSendLog(`Skipped ${duplicatesInBatch.length} duplicate address within this batch`, 'warn')
     if (!toSend.length) {
       addSendLog('Nothing left to send — every selected lead has already been contacted.', 'warn')
@@ -130,16 +133,11 @@ function ApprovalTab({ pipeline, savePipeline, showToast }) {
     const followUpDate = new Date(Date.now() + 3*24*60*60*1000).toISOString().slice(0,10)
 
     const attemptSend = async (lead) => {
-      try {
-        const r = await fetch('/api/leads/send', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ leads: [lead], subject, body, channel, counts: getAccountCounts(), preferredAccount })
-        })
-        const d = await r.json()
-        return d.results?.[0] || { status: 'failed', error: 'no result returned' }
-      } catch (err) {
-        return { status: 'failed', error: err.message }
-      }
+      const d = await apiJSON('/api/leads/send', {
+        method: 'POST',
+        body: { leads: [lead], subject, body, channel, counts: getAccountCounts(), preferredAccount }
+      })
+      return d.results?.[0] || { status: 'failed', error: d.error || 'no result returned' }
     }
 
     // Send one at a time (not one batch call) so you can watch each result
@@ -161,7 +159,7 @@ function ApprovalTab({ pipeline, savePipeline, showToast }) {
 
       if (result.status === 'sent') {
         sentIds.add(lead.id)
-        recordSend(result.sentFrom); markContacted(lead.email); setTodayCount(getTodaySentCount()); refreshCapacity()
+        if (channel === 'email') recordSend(result.sentFrom); markContacted(addressOf(lead)); setTodayCount(getTodaySentCount()); refreshCapacity()
         addSendLog(`Sent — ${lead.name} (${channel === 'sms' ? lead.phone : lead.email})${result.sentFrom ? ` via ${result.sentFrom}` : ''}`, 'sent')
         setSendTally(t => ({ ...t, sent: t.sent + 1 }))
       } else {
@@ -181,7 +179,7 @@ function ApprovalTab({ pipeline, savePipeline, showToast }) {
         const result = await attemptSend(lead)
         if (result.status === 'sent') {
           sentIds.add(lead.id)
-          recordSend(result.sentFrom); markContacted(lead.email); setTodayCount(getTodaySentCount()); refreshCapacity()
+          if (channel === 'email') recordSend(result.sentFrom); markContacted(addressOf(lead)); setTodayCount(getTodaySentCount()); refreshCapacity()
           addSendLog(`Sent on retry — ${lead.name} (${channel === 'sms' ? lead.phone : lead.email})${result.sentFrom ? ` via ${result.sentFrom}` : ''}`, 'sent')
           setSendTally(t => ({ ...t, sent: t.sent + 1, failed: t.failed - 1 }))
         } else {

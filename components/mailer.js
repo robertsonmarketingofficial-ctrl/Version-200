@@ -27,6 +27,12 @@
 //     GMAIL_USERS=one@gmail.com,two@gmail.com,three@gmail.com
 //     GMAIL_APP_PASSWORDS=pass one,pass two,pass three
 //
+//   App passwords may be pasted with or without the spaces Google shows
+//   ("abcd efgh ijkl mnop") — spaces and stray quotes are stripped.
+//
+//   Optional SMTP override (Google Workspace relay, Outlook, a test server):
+//     SMTP_HOST=smtp.example.com  SMTP_PORT=587  SMTP_SECURE=false
+//
 // NOTE: Google can flag linked accounts doing automated outbound sending.
 // Rotation raises total capacity but does not remove that risk — a Google
 // Workspace account (2,000/day on one legitimate account) is the lower-risk
@@ -35,6 +41,7 @@
 import nodemailer from 'nodemailer'
 
 export const DAILY_CAP_PER_ACCOUNT = 490 // Google hard-blocks at ~500/day per account; 490 leaves a small buffer
+const SEND_BUDGET_MS = Number(process.env.SEND_BUDGET_MS || 35000)
 
 const transporters = new Map()      // email -> nodemailer transporter
 const fallbackCounts = new Map()    // email -> { date, count } (only used if client sends no counts)
@@ -42,10 +49,42 @@ const brokenAccounts = new Map()    // email -> { reason, at } — auth failures
 
 // Auth/config failures are permanent until fixed — no point retrying these
 // on every single send. Rate limits and network blips are NOT permanent.
-function isPermanentFailure(msg = '') {
-  const m = msg.toLowerCase()
-  return m.includes('invalid login') || m.includes('username and password not accepted') ||
-         m.includes('authentication failed') || m.includes('535')
+function isPermanentFailure(err) {
+  const m = (err?.message || String(err || '')).toLowerCase()
+  return err?.code === 'EAUTH' || err?.responseCode === 535 || err?.responseCode === 534 ||
+         m.includes('invalid login') || m.includes('username and password not accepted') ||
+         m.includes('authentication failed') || m.includes('application-specific password required')
+}
+
+// Turn nodemailer/Gmail errors into something actionable in the UI log.
+export function explainError(err) {
+  const raw = err?.message || String(err || 'Unknown error')
+  const m = raw.toLowerCase()
+  if (m.includes('application-specific password required') || err?.responseCode === 534)
+    return `Gmail requires an App Password, not your normal password (turn on 2-Step Verification, then create one at myaccount.google.com/apppasswords). [${raw}]`
+  if (isPermanentFailure(err))
+    return `Gmail rejected the login — check the address and 16-character App Password for this account. [${raw}]`
+  if (err?.code === 'ETIMEDOUT' || err?.code === 'ECONNECTION' || m.includes('timeout') || m.includes('greeting never received'))
+    return `Could not reach Gmail's SMTP server in time (${err?.code || 'timeout'}). Usually temporary — it will be retried. [${raw}]`
+  if (err?.responseCode === 550 || err?.responseCode === 553 || m.includes('recipient address rejected') || m.includes('no such user'))
+    return `Recipient address rejected: ${raw}`
+  if (err?.responseCode === 421 || err?.responseCode === 454 || m.includes('daily user sending limit') || m.includes('rate limit'))
+    return `Gmail is rate-limiting this account: ${raw}`
+  return raw
+}
+
+// Recipient-side problems (bad address) — trying another account won't help.
+function isRecipientFailure(err) {
+  const m = (err?.message || '').toLowerCase()
+  return err?.code === 'EENVELOPE' || err?.responseCode === 550 || err?.responseCode === 553 ||
+         m.includes('recipient address rejected') || m.includes('no such user')
+}
+
+// Gmail's own "you've sent too much today" — treat the account as full.
+function isQuotaFailure(err) {
+  const m = (err?.message || '').toLowerCase()
+  return m.includes('daily user sending limit') || m.includes('sending limit exceeded') ||
+         (err?.responseCode === 550 && m.includes('5.4.5'))
 }
 
 // Use Adelaide time for the daily reset, not UTC — otherwise the counter
@@ -54,9 +93,15 @@ export function todayStr() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Australia/Adelaide' })
 }
 
+// Env values are often pasted with surrounding quotes, and Google displays
+// app passwords as four groups of four ("abcd efgh ijkl mnop"). App
+// passwords never contain spaces, so strip all whitespace from them.
+const cleanUser = (v = '') => v.trim().replace(/^["']|["']$/g, '').trim()
+const cleanPass = (v = '') => v.trim().replace(/^["']|["']$/g, '').replace(/\s+/g, '')
+
 export function getAccounts() {
-  const multiUsers = (process.env.GMAIL_USERS || '').split(',').map(s => s.trim()).filter(Boolean)
-  const multiPasses = (process.env.GMAIL_APP_PASSWORDS || '').split(',').map(s => s.trim()).filter(Boolean)
+  const multiUsers = (process.env.GMAIL_USERS || '').split(',').map(cleanUser).filter(Boolean)
+  const multiPasses = (process.env.GMAIL_APP_PASSWORDS || '').split(',').map(cleanPass).filter(Boolean)
 
   if (multiUsers.length && multiUsers.length === multiPasses.length) {
     return multiUsers.map((user, i) => ({ user, pass: multiPasses[i] }))
@@ -65,7 +110,7 @@ export function getAccounts() {
     console.error(`GMAIL_USERS has ${multiUsers.length} entries but GMAIL_APP_PASSWORDS has ${multiPasses.length} — they must match. Falling back to single-account config.`)
   }
   if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
-    return [{ user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }]
+    return [{ user: cleanUser(process.env.GMAIL_USER), pass: cleanPass(process.env.GMAIL_APP_PASSWORD) }]
   }
   return []
 }
@@ -82,17 +127,71 @@ function recordFallbackSend(email) {
   else rec.count++
 }
 
+// WHY NO CONNECTION POOL: on Vercel the function is frozen between
+// requests. A pooled SMTP socket left open across a freeze is dead when the
+// function thaws, and the next send fails with "Connection closed" or hangs
+// until Vercel's 60s limit kills the request (the browser then gets an HTML
+// 504 page instead of JSON). A fresh connection per send costs ~1s and is
+// reliable.
+//
+// Explicit timeouts keep one slow/unreachable account from eating the whole
+// 60s budget — it fails fast and the next account is tried instead.
+function smtpOptions(account) {
+  const host = process.env.SMTP_HOST
+  if (host) {
+    const port = Number(process.env.SMTP_PORT || 587)
+    return {
+      host, port,
+      secure: process.env.SMTP_SECURE ? process.env.SMTP_SECURE === 'true' : port === 465,
+      auth: { user: account.user, pass: account.pass },
+    }
+  }
+  return {
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: { user: account.user, pass: account.pass },
+  }
+}
+
 function getTransporter(account) {
   if (transporters.has(account.user)) return transporters.get(account.user)
   const t = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: account.user, pass: account.pass },
-    pool: true,            // reuse connections instead of reconnecting per email
-    maxConnections: 1,
-    maxMessages: 100,
+    ...smtpOptions(account),
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    dnsTimeout: 8000,
   })
   transporters.set(account.user, t)
   return t
+}
+
+/**
+ * Actually log in to every configured account (SMTP AUTH, no email sent).
+ * Server memory is wiped between invocations, so "broken" flags alone can't
+ * tell the UI whether a password is wrong — this can.
+ */
+export async function verifyAccounts() {
+  const accounts = getAccounts()
+  const results = await Promise.all(accounts.map(async (a) => {
+    const started = Date.now()
+    try {
+      await getTransporter(a).verify()
+      brokenAccounts.delete(a.user)
+      return { user: a.user, ok: true, ms: Date.now() - started }
+    } catch (err) {
+      transporters.delete(a.user)
+      if (isPermanentFailure(err)) brokenAccounts.set(a.user, { reason: err.message, at: Date.now() })
+      return { user: a.user, ok: false, error: explainError(err), code: err.code || null, ms: Date.now() - started }
+    }
+  }))
+  return {
+    accountCount: accounts.length,
+    okCount: results.filter(r => r.ok).length,
+    accounts: results,
+    passwordLengths: accounts.map(a => a.pass.length), // 16 expected for Gmail App Passwords
+  }
 }
 
 export function getConfigStatus() {
@@ -155,24 +254,58 @@ export async function sendMail({ to, subject, text, counts, preferredAccount }) 
   // SEQUENTIAL FILL: use accounts in configured order — fill account 1 to
   // its cap, then move to account 2, and so on.
 
-  let lastError = null
+  const recipient = String(to || '').trim()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) {
+    return { success: false, error: `"${to}" is not a valid email address`, allExhausted: false }
+  }
+
+  const fromName = process.env.EMAIL_FROM_NAME || 'Callum @ Robertson Marketing'
+  const errors = []
+  let quotaHits = 0
+  // Vercel kills the function at 60s. Stop trying further accounts once
+  // ~35s have gone, so the caller always gets a real JSON answer back.
+  const deadline = Date.now() + SEND_BUDGET_MS
   for (const account of eligible) {
+    if (errors.length && Date.now() > deadline) {
+      errors.push('Stopped trying other accounts to stay inside the server time limit — will retry.')
+      break
+    }
     try {
       const info = await getTransporter(account).sendMail({
-        from: `"Callum @ Robertson Marketing" <${account.user}>`,
-        to, subject, text,
+        from: { name: fromName, address: account.user },
+        to: recipient, subject, text,
+        replyTo: process.env.EMAIL_REPLY_TO || undefined,
       })
       recordFallbackSend(account.user)
+      // Gmail can accept the message but reject every recipient
+      if (info.rejected?.length && !info.accepted?.length) {
+        return { success: false, error: `Recipient rejected by Gmail: ${info.rejected.join(', ')}`, allExhausted: false }
+      }
       return { success: true, messageId: info.messageId, sentFrom: account.user }
     } catch (err) {
-      lastError = err.message
       transporters.delete(account.user)
-      if (isPermanentFailure(err.message)) {
+      const msg = explainError(err)
+      console.error(`[mailer] send via ${account.user} to ${recipient} failed:`, err.code, err.responseCode, err.message)
+      errors.push(`${account.user}: ${msg}`)
+      if (isRecipientFailure(err)) {
+        // The address itself is bad — another account would fail the same way.
+        return { success: false, error: msg, allExhausted: false }
+      }
+      if (isPermanentFailure(err)) {
         // Mark it broken so we stop wasting attempts on it every send
-        brokenAccounts.set(account.user, { reason: err.message, at: Date.now() })
+        brokenAccounts.set(account.user, { reason: msg, at: Date.now() })
+      }
+      if (isQuotaFailure(err)) {
+        quotaHits++
+        fallbackCounts.set(account.user, { date: todayStr(), count: DAILY_CAP_PER_ACCOUNT })
       }
       continue // fall through to the next account
     }
   }
-  return { success: false, error: lastError || 'All configured accounts failed to send', allExhausted: false }
+  const everyAccountDead = accounts.every(a => brokenAccounts.has(a.user)) || quotaHits === eligible.length
+  return {
+    success: false,
+    error: errors.join(' | ') || 'All configured accounts failed to send',
+    allExhausted: everyAccountDead,
+  }
 }

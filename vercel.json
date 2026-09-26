@@ -1,12 +1,29 @@
 {
   "framework": "nextjs",
   "functions": {
-    "pages/api/search.js": { "maxDuration": 60 },
-    "pages/api/afk-search.js": { "maxDuration": 60 },
-    "pages/api/afk-contact.js": { "maxDuration": 60 },
-    "pages/api/leads/send.js": { "maxDuration": 60 },
-    "pages/api/ai.js": { "maxDuration": 60 },
-    "pages/api/scrape-email.js": { "maxDuration": 30 },
-    "pages/api/test-keys.js": { "maxDuration": 30 }
+    "pages/api/search.js": {
+      "maxDuration": 60
+    },
+    "pages/api/afk-search.js": {
+      "maxDuration": 60
+    },
+    "pages/api/afk-contact.js": {
+      "maxDuration": 60
+    },
+    "pages/api/leads/send.js": {
+      "maxDuration": 60
+    },
+    "pages/api/ai.js": {
+      "maxDuration": 60
+    },
+    "pages/api/scrape-email.js": {
+      "maxDuration": 30
+    },
+    "pages/api/test-keys.js": {
+      "maxDuration": 30
+    },
+    "pages/api/email-verify.js": {
+      "maxDuration": 30
+    }
   }
 }

@@ -1,10 +1,42 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Spinner, TierTag, ScoreRing, CopyBtn, Modal, EmptyState, CATEGORIES, STAGES, parseEmails, callAI } from '../shared'
 import { PageHeader } from './helpers'
+import { getContactedCount, exportContacted, importContacted, clearContacted, getAccountCounts, recordSend } from '../sendTracker'
+import { apiJSON } from '../api'
 function SettingsTab({ pipeline, savePipeline, showToast }) {
   const [status, setStatus] = useState(null)
   const [testing, setTesting] = useState(false)
   const [contactedCount, setContactedCount] = useState(0)
+  const [gmail, setGmail] = useState(null)
+  const [gmailChecking, setGmailChecking] = useState(false)
+  const [testTo, setTestTo] = useState('')
+  const [testSending, setTestSending] = useState(false)
+  const [testResult, setTestResult] = useState(null)
+
+  const checkGmail = async () => {
+    setGmailChecking(true); setGmail(null)
+    const [cfg, verify] = await Promise.all([apiJSON('/api/email-capacity'), apiJSON('/api/email-verify')])
+    setGmail({ cfg, verify })
+    setGmailChecking(false)
+  }
+
+  const sendTestEmail = async () => {
+    if (!testTo.trim()) { showToast?.('Enter an email address to send the test to'); return }
+    setTestSending(true); setTestResult(null)
+    const d = await apiJSON('/api/leads/send', {
+      method: 'POST',
+      body: {
+        channel: 'email', counts: getAccountCounts(),
+        leads: [{ id: 'settings-test', name: 'Test', email: testTo.trim(), category: 'test' }],
+        subject: 'Robertson CRM test email',
+        body: 'If you can read this, email sending from the CRM is working.\n\n— Robertson CRM',
+      }
+    })
+    const r = d.results?.[0] || { status: 'failed', error: d.error || 'No result returned' }
+    if (r.status === 'sent') recordSend(r.sentFrom)
+    setTestResult(r)
+    setTestSending(false)
+  }
 
   useEffect(() => { setContactedCount(getContactedCount()) }, [])
 
@@ -71,9 +103,7 @@ function SettingsTab({ pipeline, savePipeline, showToast }) {
   const testKeys = async () => {
     setTesting(true); setStatus(null)
     try {
-      const res = await fetch('/api/test-keys')
-      const data = await res.json()
-      setStatus(data)
+      setStatus(await apiJSON('/api/test-keys'))
     } catch (e) {
       setStatus({ error: e.message })
     }
@@ -94,6 +124,56 @@ function SettingsTab({ pipeline, savePipeline, showToast }) {
   return (
     <div>
       <PageHeader title="Settings & Debug" sub="Test your API keys and diagnose AI issues" />
+
+      <div className="card card-p" style={{ marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>✉ Email Sending (Gmail)</div>
+            <div style={{ fontSize: 13, color: 'var(--text3)' }}>Logs in to every configured Gmail account without sending anything, so a wrong App Password shows up here instead of halfway through a run.</div>
+          </div>
+          <button onClick={checkGmail} disabled={gmailChecking} className="btn btn-primary btn-sm">
+            {gmailChecking ? <><Spinner size={12} /> Checking...</> : 'Test Gmail Login'}
+          </button>
+        </div>
+
+        {gmail && (
+          <div style={{ marginTop: 14, fontSize: 13 }}>
+            {!gmail.cfg?.accountCount ? (
+              <div style={{ padding: 12, borderRadius: 8, background: 'rgba(244,63,94,0.1)', color: '#f43f5e' }}>
+                No Gmail accounts configured. In Vercel → Settings → Environment Variables add <b>GMAIL_USERS</b> and <b>GMAIL_APP_PASSWORDS</b> (comma-separated, same order), or <b>GMAIL_USER</b> + <b>GMAIL_APP_PASSWORD</b> for one account — then redeploy.
+              </div>
+            ) : (
+              <>
+                {(gmail.verify?.accounts || []).map((a, i) => (
+                  <div key={a.user} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '8px 0', borderTop: '1px solid var(--border)' }}>
+                    <span style={{ padding: '2px 10px', borderRadius: 100, fontSize: 12, fontWeight: 700, flexShrink: 0, background: a.ok ? 'rgba(122,158,73,0.12)' : 'rgba(244,63,94,0.12)', color: a.ok ? '#7a9e49' : '#f43f5e' }}>{a.ok ? '✓ Login OK' : '✗ Failed'}</span>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ color: 'var(--text)', fontWeight: 600 }}>{a.user}</div>
+                      {!a.ok && <div style={{ color: 'var(--text3)', fontSize: 12, wordBreak: 'break-word' }}>{a.error}</div>}
+                      {gmail.verify.passwordLengths?.[i] !== undefined && gmail.verify.passwordLengths[i] !== 16 && (
+                        <div style={{ color: '#eab308', fontSize: 12 }}>⚠ Password is {gmail.verify.passwordLengths[i]} characters — Gmail App Passwords are 16 letters.</div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+                {gmail.verify?.error && <div style={{ color: '#f43f5e' }}>{gmail.verify.error}</div>}
+              </>
+            )}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+          <input value={testTo} onChange={e => setTestTo(e.target.value)} placeholder="your@email.com" type="email" style={{ flex: 1, minWidth: 200, padding: '7px 10px', borderRadius: 8, fontSize: 13 }} />
+          <button onClick={sendTestEmail} disabled={testSending} className="btn btn-ghost btn-sm">
+            {testSending ? <><Spinner size={12} /> Sending...</> : 'Send Test Email'}
+          </button>
+        </div>
+        {testResult && (
+          <div style={{ marginTop: 8, fontSize: 13, color: testResult.status === 'sent' ? '#7a9e49' : '#f43f5e', wordBreak: 'break-word' }}>
+            {testResult.status === 'sent' ? `✓ Sent via ${testResult.sentFrom} — check the inbox (and spam folder).` : `✗ ${testResult.error || testResult.reason || testResult.status}`}
+          </div>
+        )}
+      </div>
 
       <div className="card card-p" style={{ marginBottom: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>

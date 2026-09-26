@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Spinner } from '../shared'
 import { PageHeader, AU_STATES } from './helpers'
 import { getTodaySentCount, recordSend, getAccountCounts, buildCapacityView, hasBeenContacted, markContacted } from '../sendTracker'
+import { apiJSON } from '../api'
 
 // AFK Mode: pick a state + niche, hit Start, walk away. Finds businesses
 // across that state's suburbs, gets contact info, and emails/texts them
@@ -54,6 +55,9 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
   const [testSending, setTestSending] = useState(false)
   const [lastResults, setLastResults] = useState([])
   const stopRef = useRef(false)
+  // The run loop is one long async function, so it would only ever see the
+  // `capacity` value from when it started. Read the live value via a ref.
+  const capacityRef = useRef(null)
   const logBoxRef = useRef(null)
   const stickToBottomRef = useRef(true)
 
@@ -71,9 +75,10 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
   }
   const refreshCapacity = async () => {
     try {
-      const r = await fetch('/api/email-capacity')
-      const config = await r.json()
-      setCapacity(buildCapacityView(config))
+      const config = await apiJSON('/api/email-capacity')
+      const view = buildCapacityView(config)
+      capacityRef.current = view
+      setCapacity(view)
     } catch {}
   }
   useEffect(() => { refreshCapacity() }, [])
@@ -88,11 +93,10 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
       if (channel === 'sms') testLead.phone = testTo.trim()
       else testLead.email = testTo.trim()
 
-      const r = await fetch('/api/afk-contact', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lead: testLead, subject, body, channel, counts: getAccountCounts() })
+      const d = await apiJSON('/api/afk-contact', {
+        method: 'POST',
+        body: { lead: testLead, subject, body, channel, counts: getAccountCounts() }
       })
-      const d = await r.json()
       if (d.status === 'sent') {
         if (channel === 'email') { recordSend(d.sentFrom); setTodayCount(getTodaySentCount()); refreshCapacity() }
         showToast?.(`Test ${channel === 'sms' ? 'text' : 'email'} sent ✓`)
@@ -123,14 +127,28 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
           setPhase(null)
           return
         }
-        const live = cfg.accounts.filter(a => !a.broken)
-        if (!live.length) {
-          addLog(`Cannot start — all ${cfg.accountCount} configured account(s) failed login. Check your GMAIL_APP_PASSWORDS values.`, 'failed')
-          showToast?.('All email accounts failed login')
+        // Actually log in to Gmail. The config check above only proves the
+        // env vars exist — a wrong App Password used to pass it, then every
+        // send failed after minutes of searching.
+        addLog('Checking Gmail login for each account...')
+        const v = await apiJSON('/api/email-verify')
+        if (v.error && !v.accounts) {
+          addLog(`Cannot verify Gmail login: ${v.error}`, 'failed')
+          showToast?.('Could not verify Gmail login')
           setPhase(null)
           return
         }
-        addLog(`Sending configured: ${live.length} account(s) ready, ${cfg.totalDailyCapacity} daily capacity.`, 'sent')
+        for (const a of v.accounts || []) {
+          if (!a.ok) addLog(`${a.user}: ${a.error}`, 'failed')
+        }
+        if (!v.okCount) {
+          addLog(`Cannot start — none of the ${cfg.accountCount} Gmail account(s) could log in. Fix the errors above in Vercel → Settings → Environment Variables, then redeploy.`, 'failed')
+          showToast?.('No Gmail account could log in')
+          setPhase(null)
+          return
+        }
+        addLog(`Gmail ready: ${v.okCount}/${cfg.accountCount} account(s) logged in, ${cfg.totalDailyCapacity} daily capacity.`, 'sent')
+        await refreshCapacity()
       } catch (err) {
         addLog(`Cannot verify email setup: ${err.message}`, 'failed')
         showToast?.('Could not verify email configuration')
@@ -140,7 +158,7 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
     }
 
     if (channel === 'email') {
-      const remaining = (capacity?.totalRemaining ?? DAILY_EMAIL_CAP - getTodaySentCount())
+      const remaining = (capacityRef.current?.totalRemaining ?? DAILY_EMAIL_CAP - getTodaySentCount())
       if (remaining <= 0) {
         showToast?.(`Daily send cap reached (${DAILY_EMAIL_CAP}/day) — try again tomorrow`)
         return
@@ -175,12 +193,9 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
       if (foundMap.size >= targetCount) break
 
       try {
-        const r = await fetch('/api/afk-search', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ niche, suburb })
-        })
-        const d = await r.json()
-        if (d.error) { searchError = d.error; break }
+        const d = await apiJSON('/api/afk-search', { method: 'POST', body: { niche, suburb } })
+        if (d.error && d.status !== 'failed') { searchError = d.error; break }
+        if (d.error) { addLog(`Search error in ${suburb}: ${d.error}`, 'failed'); continue }
         let newThisSuburb = 0
         for (const lead of d.leads || []) {
           if (excludeIds.has(lead.id) || foundMap.has(lead.id)) continue
@@ -240,29 +255,16 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
 
     // Step 1: find the contact address WITHOUT sending.
     const findContact = async (lead) => {
-      try {
-        const r = await fetch('/api/afk-contact', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lead, channel, scrapeOnly: true })
-        })
-        return await r.json()
-      } catch (err) {
-        return { status: 'failed', error: err.message }
-      }
+      return apiJSON('/api/afk-contact', { method: 'POST', body: { lead, channel, scrapeOnly: true } })
     }
 
     // Step 2: actually send, with the address already known and checked.
     const sendTo = async (lead, address) => {
-      try {
-        const withAddress = channel === 'sms' ? { ...lead, phone: address } : { ...lead, email: address }
-        const r = await fetch('/api/afk-contact', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lead: withAddress, subject, body, channel, counts: getAccountCounts() })
-        })
-        return await r.json()
-      } catch (err) {
-        return { status: 'failed', error: err.message }
-      }
+      const withAddress = channel === 'sms' ? { ...lead, phone: address } : { ...lead, email: address }
+      return apiJSON('/api/afk-contact', {
+        method: 'POST',
+        body: { lead: withAddress, subject, body, channel, counts: getAccountCounts() }
+      })
     }
 
     // Scrape, check the permanent contacted history, then send only if clean.
@@ -293,12 +295,19 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
     for (const lead of leads) {
       if (stopRef.current) { addLog('Stopped by user.', 'warn'); break }
 
-      if (channel === 'email' && capacity && capacity.totalRemaining <= 0) {
+      if (channel === 'email' && capacityRef.current && capacityRef.current.totalRemaining <= 0) {
         addLog(`All accounts have hit their daily cap — stopping run. Resume tomorrow.`, 'warn')
         break
       }
 
       const d = await attemptContact(lead)
+
+      // Server says every account is capped or failed login — stop cleanly.
+      if (d.allExhausted) {
+        addLog(d.error || 'All email accounts are exhausted.', 'failed')
+        addLog('Stopped — no account can send right now.', 'failed')
+        break
+      }
 
       // Already emailed this exact address in a previous run — skip silently
       // rather than contacting the same business twice.
@@ -356,9 +365,10 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
       addLog(`Retrying ${failedLeads.length} failed send${failedLeads.length === 1 ? '' : 's'}...`, 'warn')
       for (const lead of failedLeads) {
         if (stopRef.current) break
-        if (channel === 'email' && capacity && capacity.totalRemaining <= 0) break
+        if (channel === 'email' && capacityRef.current && capacityRef.current.totalRemaining <= 0) break
 
         const d = await attemptContact(lead)
+        if (d.allExhausted) { addLog(d.error || 'All email accounts are exhausted.', 'failed'); break }
         recordResult(lead, d)
 
         if (d.status === 'sent') {

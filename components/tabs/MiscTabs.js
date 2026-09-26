@@ -2,6 +2,8 @@ import { useState, useEffect, useMemo } from 'react'
 import { Spinner, TierTag, ScoreRing, CopyBtn, Modal, EmptyState, CATEGORIES, STAGES, parseEmails, callAI } from '../shared'
 import { PageHeader, InfoItem, WebsiteStrengthBar, ScoreBar } from './helpers'
 import { EmailModal, ResearchModal, LovableModal, fmtWA } from './modals'
+import { apiJSON } from '../api'
+import { getAccountCounts, recordSend, markContacted } from '../sendTracker'
 
 
 function FollowUpTab({ pipeline, savePipeline, showToast }) {
@@ -22,22 +24,24 @@ function FollowUpTab({ pipeline, savePipeline, showToast }) {
   const sendFollowUp = async (lead) => {
     if (!lead.email) { showToast?.('No email on file for this lead'); return }
     try {
-      const r = await fetch('/api/leads/send', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          leads: [lead], channel: 'email',
+      // Pass the rolling per-account counts like every other send path, so
+      // follow-ups respect the daily cap and count toward it.
+      const d = await apiJSON('/api/leads/send', {
+        method: 'POST',
+        body: {
+          leads: [lead], channel: 'email', counts: getAccountCounts(),
           subject: `Following up, {{name}}`,
           body: `Hi {{name}},\n\nJust following up on my last email — totally understand if you're busy. Still happy to chat whenever suits.\n\nCallum\nRobertson Marketing`
-        })
+        }
       })
-      const d = await r.json()
       const ok = d.results?.[0]?.status === 'sent'
       if (ok) {
+        recordSend(d.results[0].sentFrom); markContacted(lead.email)
         const nextDate = new Date(Date.now() + 5*24*60*60*1000).toISOString().slice(0,10)
         savePipeline(pipeline.map(p => p.id === lead.id ? { ...p, followUpDate: nextDate, activityLog: [...(p.activityLog||[]), { type: 'follow-up sent', date: new Date().toISOString() }] } : p))
         showToast?.('Follow-up sent ✓')
       } else {
-        showToast?.(`Follow-up failed: ${d.results?.[0]?.error || 'unknown error'}`)
+        showToast?.(`Follow-up failed: ${d.results?.[0]?.error || d.error || 'unknown error'}`)
       }
     } catch (err) {
       showToast?.('Follow-up failed: ' + err.message)
