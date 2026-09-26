@@ -34,6 +34,11 @@ const ALL_AUSTRALIA = {
 
 const SWEEP_TARGETS = [ALL_AUSTRALIA, ...AU_STATES]
 
+// Which state each suburb belongs to, so every search is locked to it —
+// including "All of Australia" runs, which mix suburbs from every state.
+const SUBURB_STATE = {}
+for (const s of AU_STATES) for (const sub of s.suburbs) SUBURB_STATE[sub] = s.short
+
 const LOG_COLORS = { sent: '#10b981', failed: '#ef4444', info: 'var(--text2)', warn: '#eab308' }
 const LOG_ICONS = { sent: '✓', failed: '✗', info: '—', warn: '⚠' }
 
@@ -186,6 +191,7 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
     let suburbsSearched = 0
     let searchError = null
     let discardedDuringSearch = 0
+    let outOfStateDropped = 0
     let skippedAlreadyContacted = 0 // also incremented during the contact phase
 
     for (const suburb of state.suburbs) {
@@ -193,7 +199,8 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
       if (foundMap.size >= targetCount) break
 
       try {
-        const d = await apiJSON('/api/afk-search', { method: 'POST', body: { niche, suburb } })
+        const d = await apiJSON('/api/afk-search', { method: 'POST', body: { niche, suburb, state: SUBURB_STATE[suburb] } })
+        if (d.outOfState) outOfStateDropped += d.outOfState
         if (d.error && d.status !== 'failed') { searchError = d.error; break }
         if (d.error) { addLog(`Search error in ${suburb}: ${d.error}`, 'failed'); continue }
         let newThisSuburb = 0
@@ -238,6 +245,9 @@ function AFKTab({ pipeline, addManyToPipeline, savePipeline, showToast }) {
     // Leads with no way to reach them were already filtered out during the
     // search and discarded — they're never contacted and never hit the Pipeline.
     const leads = allFound.sort((a, b) => b.score - a.score)
+    if (outOfStateDropped) {
+      addLog(`Ignored ${outOfStateDropped} results Google returned from outside ${state.short === 'AUS' ? 'the searched states' : state.label}.`, 'warn')
+    }
     if (discardedDuringSearch) {
       addLog(`Discarded ${discardedDuringSearch} businesses with no ${channel === 'sms' ? 'phone number' : 'website'}.`, 'warn')
     }

@@ -99,8 +99,8 @@ function FinderTab({ pipeline = [], addToPipeline, addManyToPipeline, searchHist
     setAddedLeadIds(prev => new Set([...prev, ...noWebsiteNotAdded.map(l => l.id)]))
   }
 
-  const doSearch = async (loc, maxPages = 2) => {
-    const res = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: category, location: loc, maxPages }) })
+  const doSearch = async (loc, maxPages = 2, state = null) => {
+    const res = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: category, location: loc, maxPages, state }) })
     const data = await res.json()
     if (data.error) throw new Error(data.error)
     return (data.leads || []).map(l => ({ ...l, category }))
@@ -132,7 +132,7 @@ function FinderTab({ pipeline = [], addToPipeline, addManyToPipeline, searchHist
       const suburb = suburbs[i]
       setSweepProgress({ done: i, total: suburbs.length, current: suburb })
       try {
-        const results = await doSearch(`${suburb} ${state.short}`, 3)
+        const results = await doSearch(suburb, 3, state.short)
         const fresh = results.filter(l => !seen.has(l.id))
         fresh.forEach(l => seen.add(l.id))
         combined = [...combined, ...fresh].sort((a,b) => b.score - a.score)

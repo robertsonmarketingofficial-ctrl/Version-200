@@ -12,15 +12,15 @@ import { searchPlacesNew } from './search'
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
-  const { niche, suburb, maxPages } = req.body
+  const { niche, suburb, maxPages, state } = req.body
   const apiKey = process.env.GOOGLE_PLACES_API_KEY
   if (!apiKey) return res.status(500).json({ error: 'Google Places API key not configured' })
   if (!niche || !suburb) return res.status(400).json({ error: 'niche and suburb required' })
 
   try {
-    const result = await searchPlacesNew(niche, suburb, apiKey, maxPages || 3)
+    const result = await searchPlacesNew(niche, suburb, apiKey, maxPages || 3, state)
     if (result.error) return res.status(200).json({ leads: [], error: result.error })
-    return res.status(200).json({ leads: result.leads || [] })
+    return res.status(200).json({ leads: result.leads || [], outOfState: result.outOfState || 0 })
   } catch (err) {
     return res.status(200).json({ leads: [], error: 'Search failed: ' + err.message })
   }
